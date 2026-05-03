@@ -1037,41 +1037,56 @@
     let toDate   = new Date();
     let fromDate = new Date(+toDate - 14 * 86400 * 1000);
 
+    const parseName = async (settled) => {
+      if (settled?.status === 'fulfilled' && settled.value?.ok) {
+        const d = await settled.value.json();
+        return d.data?.[0]?.CompanyName || d.data?.[0]?.Name || '';
+      }
+      return '';
+    };
+
     try {
       const [quotesRes, infoRes] = await Promise.allSettled([
         fetchViaProxy(`${JQUANTS_API}/equities/bars/daily?code=${code5}&from=${fmt(fromDate)}&to=${fmt(toDate)}`, headers),
         fetchViaProxy(`${JQUANTS_API}/equities/master?code=${code5}`, headers),
       ]);
 
-      let companyName = '';
-      if (infoRes.status === 'fulfilled' && infoRes.value.ok) {
-        const d = await infoRes.value.json();
-        companyName = d.data?.[0]?.CompanyName || d.data?.[0]?.Name || '';
-      }
+      let companyName = await parseName(infoRes);
 
-      // 400 でサブスクリプション期間外エラーの場合、利用可能な末日で自動リトライ
+      // bars/daily が 400 でサブスクリプション期間外エラーの場合、利用可能な末日で自動リトライ
       if (quotesRes.status === 'fulfilled' && quotesRes.value.status === 400) {
         const errText = await quotesRes.value.text();
         const m = errText.match(/(\d{4}-\d{2}-\d{2}) ~ (\d{4}-\d{2}-\d{2})/);
         if (m) {
           toDate   = new Date(m[2]);
           fromDate = new Date(+toDate - 14 * 86400 * 1000);
-          const retryRes = await fetchViaProxy(
-            `${JQUANTS_API}/equities/bars/daily?code=${code5}&from=${fmt(fromDate)}&to=${fmt(toDate)}`,
-            headers
-          );
-          if (!retryRes.ok) {
-            logError(`fetchStockData(${code}): リトライ失敗`, null,
-              `${retryRes.status}: ${(await retryRes.text()).slice(0, 200)}`);
+
+          // bars/daily リトライ + 銘柄名未取得なら master も date 指定でリトライ
+          const retryTasks = [
+            fetchViaProxy(`${JQUANTS_API}/equities/bars/daily?code=${code5}&from=${fmt(fromDate)}&to=${fmt(toDate)}`, headers),
+            !companyName
+              ? fetchViaProxy(`${JQUANTS_API}/equities/master?code=${code5}&date=${fmt(toDate)}`, headers)
+              : Promise.resolve(null),
+          ];
+          const [retryQuotesRes, retryInfoRes] = await Promise.allSettled(retryTasks);
+
+          if (!companyName) companyName = await parseName(retryInfoRes);
+
+          if (retryQuotesRes.status !== 'fulfilled' || !retryQuotesRes.value.ok) {
+            const msg = retryQuotesRes.status === 'fulfilled'
+              ? `${retryQuotesRes.value.status}: ${(await retryQuotesRes.value.text()).slice(0, 200)}`
+              : String(retryQuotesRes.reason);
+            logError(`fetchStockData(${code}): リトライ失敗`, null, msg);
             return { code, name: companyName, error: true };
           }
-          const retryData = await retryRes.json();
+          const retryData   = await retryQuotesRes.value.json();
           const retryQuotes = (retryData.data || []).sort((a, b) => a.Date.localeCompare(b.Date));
           if (!retryQuotes.length) return { code, name: companyName, error: true };
-          // リトライ成功 → 以降の処理で使う quotesData の代わりに返す
           const rLatest = retryQuotes[retryQuotes.length - 1];
           const rPrev   = retryQuotes.length >= 2 ? retryQuotes[retryQuotes.length - 2] : null;
-          return buildResult(code, companyName, rLatest, rPrev, fmt(toDate));
+          const retryResult = buildResult(code, companyName, rLatest, rPrev, fmt(toDate));
+          if (!retryResult.error) cachePrice(code, retryResult);
+          return retryResult.error ? { code, name: companyName, error: true } : retryResult;
         }
       }
 
