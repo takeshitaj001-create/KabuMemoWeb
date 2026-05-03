@@ -663,7 +663,8 @@
     <p style="font-size:12px;color:#888;margin-bottom:16px;line-height:1.7;">
       <a href="https://jpx-jquants.com/" target="_blank" rel="noopener" style="color:#0066cc;">J-Quants</a>
       ダッシュボードで発行した API キーを入力してください。<br>
-      API キーはブラウザの localStorage にのみ保存されます。
+      API キーはブラウザの localStorage にのみ保存されます。<br>
+      <span style="color:#e65100;">※ 株価取得は公開 CORS プロキシ経由で行います。API キーがプロキシを通過します。</span>
     </p>
     <div class="dialog-field">
       <label for="jq-api-key">API キー</label>
@@ -871,6 +872,12 @@
   const TODAY          = new Date().toISOString().slice(0, 10);
   const CACHE_DURATION = 24 * 60 * 60 * 1000;
 
+  // J-Quants API v2 はブラウザからの直接 CORS リクエストを拒否するため公開プロキシ経由で呼ぶ
+  const CORS_PROXIES = [
+    'https://corsproxy.io/?',
+    'https://proxy.cors.sh/',
+  ];
+
   // ===== 状態 =====
   let stocks = [];
   const priceCache = {};
@@ -912,6 +919,18 @@
 
   function getApiKey() {
     return loadJQConfig().apiKey || null;
+  }
+
+  // ===== CORS プロキシ経由フェッチ =====
+  async function fetchViaProxy(url, headers) {
+    for (const proxy of CORS_PROXIES) {
+      try {
+        const r = await fetch(proxy + encodeURIComponent(url), { headers });
+        // 4xx はサーバー到達済み（認証エラー等）なので返す
+        if (r.ok || (r.status >= 400 && r.status < 500)) return r;
+      } catch { /* 次のプロキシを試す */ }
+    }
+    throw new Error('全プロキシで接続失敗');
   }
 
   // ===== エラーログ =====
@@ -987,8 +1006,8 @@
 
     try {
       const [quotesRes, infoRes] = await Promise.allSettled([
-        fetch(`${JQUANTS_API}/equities/bars/daily?code=${code5}&from=${fmt(fromDate)}&to=${fmt(toDate)}`, { headers }),
-        fetch(`${JQUANTS_API}/equities/master?code=${code5}`, { headers }),
+        fetchViaProxy(`${JQUANTS_API}/equities/bars/daily?code=${code5}&from=${fmt(fromDate)}&to=${fmt(toDate)}`, headers),
+        fetchViaProxy(`${JQUANTS_API}/equities/master?code=${code5}`, headers),
       ]);
 
       let companyName = '';
@@ -1000,7 +1019,7 @@
       if (quotesRes.status !== 'fulfilled' || !quotesRes.value.ok) {
         const status = quotesRes.status === 'fulfilled'
           ? `${quotesRes.value.status}: ${(await quotesRes.value.text()).slice(0, 200)}`
-          : `network error — file:// で直接開いている場合は CORS 制限により動作しません。GitHub Pages 等の https:// URL から開いてください。(${quotesRes.reason})`;
+          : `全プロキシで接続失敗 — ネットワーク接続を確認してください。(${quotesRes.reason})`;
         logError(`fetchStockData(${code}): bars/daily 失敗`, null, status);
         return { code, name: companyName, error: true };
       }
