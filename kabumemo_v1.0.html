@@ -983,6 +983,37 @@
     btn.textContent = panel.classList.contains('collapsed') ? '▼ 展開' : '▲ 折りたたむ';
   }
 
+  // ===== 価格結果オブジェクト生成 =====
+  function buildResult(code, name, latest, prev, dataDate) {
+    const price = latest.C ?? latest.Close;
+    if (price == null) return { code, error: true };
+    const prevClose  = prev ? (prev.C ?? prev.Close) : null;
+    const change     = prevClose != null ? price - prevClose : null;
+    const changeRate = (change != null && prevClose) ? (change / prevClose) * 100 : null;
+    const dir        = change > 0 ? 'up' : change < 0 ? 'down' : 'flat';
+    let changeText = '―';
+    if (change != null) {
+      const sign   = change >= 0 ? '▲' : '▼';
+      const absChg = Math.abs(change).toLocaleString('ja-JP', { maximumFractionDigits: 1 });
+      changeText   = changeRate != null
+        ? `${sign} ${absChg} (${change >= 0 ? '+' : '-'}${Math.abs(changeRate).toFixed(2)}%)`
+        : `${sign} ${absChg}`;
+    }
+    return {
+      code, name,
+      price, priceText: price.toLocaleString('ja-JP'),
+      change, changeRate, changeText, dir,
+      per: null, pbr: null, divYield: null, divPerShr: null,
+      open:   latest.O  ?? latest.Open   ?? null,
+      high:   latest.H  ?? latest.High   ?? null,
+      low:    latest.L  ?? latest.Low    ?? null,
+      volume: latest.Vo ?? latest.Volume ?? null,
+      highYear: null, lowYear: null, marketCap: null,
+      dataDate: dataDate || null,
+      error: false,
+    };
+  }
+
   // ===== 株価取得（J-Quants API v2）=====
   async function fetchStockData(code) {
     const cached = getCachedPrice(code);
@@ -1000,9 +1031,11 @@
 
     const code5   = code + '0'; // 4桁→5桁（J-Quants形式）
     const headers = { 'x-api-key': apiKey };
-    const toDate   = new Date();
-    const fromDate = new Date(+toDate - 14 * 86400 * 1000);
-    const fmt      = d => d.toISOString().slice(0, 10);
+    const fmt     = d => d.toISOString().slice(0, 10);
+
+    // サブスクリプション期間の末日（初回は今日、400 エラー時に自動調整）
+    let toDate   = new Date();
+    let fromDate = new Date(+toDate - 14 * 86400 * 1000);
 
     try {
       const [quotesRes, infoRes] = await Promise.allSettled([
@@ -1014,6 +1047,32 @@
       if (infoRes.status === 'fulfilled' && infoRes.value.ok) {
         const d = await infoRes.value.json();
         companyName = d.data?.[0]?.CompanyName || d.data?.[0]?.Name || '';
+      }
+
+      // 400 でサブスクリプション期間外エラーの場合、利用可能な末日で自動リトライ
+      if (quotesRes.status === 'fulfilled' && quotesRes.value.status === 400) {
+        const errText = await quotesRes.value.text();
+        const m = errText.match(/(\d{4}-\d{2}-\d{2}) ~ (\d{4}-\d{2}-\d{2})/);
+        if (m) {
+          toDate   = new Date(m[2]);
+          fromDate = new Date(+toDate - 14 * 86400 * 1000);
+          const retryRes = await fetchViaProxy(
+            `${JQUANTS_API}/equities/bars/daily?code=${code5}&from=${fmt(fromDate)}&to=${fmt(toDate)}`,
+            headers
+          );
+          if (!retryRes.ok) {
+            logError(`fetchStockData(${code}): リトライ失敗`, null,
+              `${retryRes.status}: ${(await retryRes.text()).slice(0, 200)}`);
+            return { code, name: companyName, error: true };
+          }
+          const retryData = await retryRes.json();
+          const retryQuotes = (retryData.data || []).sort((a, b) => a.Date.localeCompare(b.Date));
+          if (!retryQuotes.length) return { code, name: companyName, error: true };
+          // リトライ成功 → 以降の処理で使う quotesData の代わりに返す
+          const rLatest = retryQuotes[retryQuotes.length - 1];
+          const rPrev   = retryQuotes.length >= 2 ? retryQuotes[retryQuotes.length - 2] : null;
+          return buildResult(code, companyName, rLatest, rPrev, fmt(toDate));
+        }
       }
 
       if (quotesRes.status !== 'fulfilled' || !quotesRes.value.ok) {
@@ -1035,41 +1094,12 @@
 
       const latest = quotes[quotes.length - 1];
       const prev   = quotes.length >= 2 ? quotes[quotes.length - 2] : null;
-      const price  = latest.C ?? latest.Close;
+      const result = buildResult(code, companyName, latest, prev, null);
 
-      if (price == null) {
+      if (result.error) {
         logError(`fetchStockData(${code}): Close 値なし`, null, JSON.stringify(latest));
         return { code, name: companyName, error: true };
       }
-
-      const prevClose  = prev ? (prev.C ?? prev.Close) : null;
-      const change     = prevClose != null ? price - prevClose : null;
-      const changeRate = (change != null && prevClose) ? (change / prevClose) * 100 : null;
-      const dir        = change > 0 ? 'up' : change < 0 ? 'down' : 'flat';
-
-      let changeText = '―';
-      if (change != null) {
-        const sign   = change >= 0 ? '▲' : '▼';
-        const absChg = Math.abs(change).toLocaleString('ja-JP', { maximumFractionDigits: 1 });
-        changeText   = changeRate != null
-          ? `${sign} ${absChg} (${change >= 0 ? '+' : '-'}${Math.abs(changeRate).toFixed(2)}%)`
-          : `${sign} ${absChg}`;
-      }
-
-      const result = {
-        code,
-        name:      companyName,
-        price,
-        priceText: price.toLocaleString('ja-JP'),
-        change, changeRate, changeText, dir,
-        per: null, pbr: null, divYield: null, divPerShr: null,
-        open:     latest.O  ?? latest.Open   ?? null,
-        high:     latest.H  ?? latest.High   ?? null,
-        low:      latest.L  ?? latest.Low    ?? null,
-        volume:   latest.Vo ?? latest.Volume ?? null,
-        highYear: null, lowYear: null, marketCap: null,
-        error: false,
-      };
 
       cachePrice(code, result);
       return result;
