@@ -1014,106 +1014,90 @@
     };
   }
 
-  // ===== 株価取得（J-Quants API v2）=====
+  // ===== 株価取得（Yahoo Finance JSON API）=====
   async function fetchStockData(code) {
     const cached = getCachedPrice(code);
     if (cached) return cached;
 
-    const apiKey = getApiKey();
-    if (!apiKey) {
-      logError(
-        `fetchStockData(${code}): API キー未設定`,
-        null,
-        '⚙️ 設定ボタンから J-Quants の API キーを登録してください'
-      );
-      return { code, error: true };
-    }
-
-    const code5   = code + '0'; // 4桁→5桁（J-Quants形式）
-    const headers = { 'x-api-key': apiKey };
-    const fmt     = d => d.toISOString().slice(0, 10);
-
-    // サブスクリプション期間の末日（初回は今日、400 エラー時に自動調整）
-    let toDate   = new Date();
-    let fromDate = new Date(+toDate - 14 * 86400 * 1000);
-
-    const parseName = async (settled) => {
-      if (settled?.status === 'fulfilled' && settled.value?.ok) {
-        const d = await settled.value.json();
-        return d.data?.[0]?.CompanyName || d.data?.[0]?.Name || '';
-      }
-      return '';
-    };
+    // 東証ティッカー形式: 7203.T
+    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${code}.T?interval=1d&range=5d`;
 
     try {
-      const [quotesRes, infoRes] = await Promise.allSettled([
-        fetchViaProxy(`${JQUANTS_API}/equities/bars/daily?code=${code5}&from=${fmt(fromDate)}&to=${fmt(toDate)}`, headers),
-        fetchViaProxy(`${JQUANTS_API}/equities/master?code=${code5}`, headers),
-      ]);
-
-      let companyName = await parseName(infoRes);
-
-      // bars/daily が 400 でサブスクリプション期間外エラーの場合、利用可能な末日で自動リトライ
-      if (quotesRes.status === 'fulfilled' && quotesRes.value.status === 400) {
-        const errText = await quotesRes.value.text();
-        const m = errText.match(/(\d{4}-\d{2}-\d{2}) ~ (\d{4}-\d{2}-\d{2})/);
-        if (m) {
-          toDate   = new Date(m[2]);
-          fromDate = new Date(+toDate - 14 * 86400 * 1000);
-
-          // bars/daily リトライ + 銘柄名未取得なら master も date 指定でリトライ
-          const retryTasks = [
-            fetchViaProxy(`${JQUANTS_API}/equities/bars/daily?code=${code5}&from=${fmt(fromDate)}&to=${fmt(toDate)}`, headers),
-            !companyName
-              ? fetchViaProxy(`${JQUANTS_API}/equities/master?code=${code5}&date=${fmt(toDate)}`, headers)
-              : Promise.resolve(null),
-          ];
-          const [retryQuotesRes, retryInfoRes] = await Promise.allSettled(retryTasks);
-
-          if (!companyName) companyName = await parseName(retryInfoRes);
-
-          if (retryQuotesRes.status !== 'fulfilled' || !retryQuotesRes.value.ok) {
-            const msg = retryQuotesRes.status === 'fulfilled'
-              ? `${retryQuotesRes.value.status}: ${(await retryQuotesRes.value.text()).slice(0, 200)}`
-              : String(retryQuotesRes.reason);
-            logError(`fetchStockData(${code}): リトライ失敗`, null, msg);
-            return { code, name: companyName, error: true };
-          }
-          const retryData   = await retryQuotesRes.value.json();
-          const retryQuotes = (retryData.data || []).sort((a, b) => a.Date.localeCompare(b.Date));
-          if (!retryQuotes.length) return { code, name: companyName, error: true };
-          const rLatest = retryQuotes[retryQuotes.length - 1];
-          const rPrev   = retryQuotes.length >= 2 ? retryQuotes[retryQuotes.length - 2] : null;
-          const retryResult = buildResult(code, companyName, rLatest, rPrev, fmt(toDate));
-          if (!retryResult.error) cachePrice(code, retryResult);
-          return retryResult.error ? { code, name: companyName, error: true } : retryResult;
+      // Yahoo Finance は CORS 対応のため直接フェッチを試みる
+      // プロキシ経由だと圧縮レスポンスが正しく展開されない問題を回避
+      // 直接フェッチを試み、CORS 失敗時は allorigins /get 経由にフォールバック
+      // allorigins はサーバー側で取得→展開→JSON ラップするため brotli 問題を回避できる
+      let data;
+      try {
+        const res = await fetch(url);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        data = await res.json();
+      } catch {
+        const proxyUrl = `https://api.allorigins.win/get?url=${encodeURIComponent(url)}`;
+        const proxyRes = await fetch(proxyUrl);
+        if (!proxyRes.ok) {
+          logError(`fetchStockData(${code}): allorigins HTTP ${proxyRes.status}`, null, '');
+          return { code, error: true };
+        }
+        const wrapper = await proxyRes.json();
+        if (!wrapper.contents) {
+          logError(`fetchStockData(${code}): allorigins contents が空`, null, JSON.stringify(wrapper).slice(0, 200));
+          return { code, error: true };
+        }
+        try {
+          data = JSON.parse(wrapper.contents);
+        } catch (e) {
+          logError(`fetchStockData(${code}): JSON パース失敗`, e, wrapper.contents.slice(0, 200));
+          return { code, error: true };
         }
       }
-
-      if (quotesRes.status !== 'fulfilled' || !quotesRes.value.ok) {
-        const status = quotesRes.status === 'fulfilled'
-          ? `${quotesRes.value.status}: ${(await quotesRes.value.text()).slice(0, 200)}`
-          : `全プロキシで接続失敗 — ネットワーク接続を確認してください。(${quotesRes.reason})`;
-        logError(`fetchStockData(${code}): bars/daily 失敗`, null, status);
-        return { code, name: companyName, error: true };
+      const chartResult = data.chart?.result?.[0];
+      if (!chartResult) {
+        logError(`fetchStockData(${code}): レスポンス構造が不正`, null, JSON.stringify(data).slice(0, 300));
+        return { code, error: true };
       }
 
-      const quotesData = await quotesRes.value.json();
-      // v2: データは "data" キーの配列、フィールド名短縮（C=Close, O=Open, H=High, L=Low, Vo=Volume）
-      const quotes = (quotesData.data || []).sort((a, b) => a.Date.localeCompare(b.Date));
+      const meta       = chartResult.meta;
+      const timestamps = chartResult.timestamp || [];
+      const q          = chartResult.indicators?.quote?.[0] || {};
+      const closes     = q.close  || [];
+      const opens      = q.open   || [];
+      const highs      = q.high   || [];
+      const lows       = q.low    || [];
+      const volumes    = q.volume || [];
 
-      if (!quotes.length) {
-        logError(`fetchStockData(${code}): 株価データなし（直近14日）`, null, `code5=${code5}`);
-        return { code, name: companyName, error: true };
+      // null を除いた最新インデックスを取得
+      let li = closes.length - 1;
+      while (li >= 0 && closes[li] == null) li--;
+      if (li < 0) {
+        logError(`fetchStockData(${code}): 有効な終値なし`, null, '');
+        return { code, error: true };
       }
 
-      const latest = quotes[quotes.length - 1];
-      const prev   = quotes.length >= 2 ? quotes[quotes.length - 2] : null;
-      const result = buildResult(code, companyName, latest, prev, null);
+      const toDate = ts => new Date(ts * 1000).toISOString().slice(0, 10);
+      const latest = {
+        Close:  closes[li],
+        Open:   opens[li]   ?? null,
+        High:   highs[li]   ?? null,
+        Low:    lows[li]    ?? null,
+        Volume: volumes[li] ?? null,
+        Date:   timestamps[li] ? toDate(timestamps[li]) : TODAY,
+      };
 
+      let pi = li - 1;
+      while (pi >= 0 && closes[pi] == null) pi--;
+      const prevClose = pi >= 0 ? closes[pi]
+                      : (meta.previousClose ?? meta.chartPreviousClose ?? null);
+      const prev = prevClose != null ? { Close: prevClose } : null;
+
+      // Yahoo Finance から銘柄名を取得（未保存の場合のみ利用）
+      const storedName   = findStock(code)?.name || '';
+      const companyName  = storedName || meta.shortName || meta.longName || '';
+
+      const result = buildResult(code, companyName, latest, prev, latest.Date);
       if (result.error) {
-        logError(`fetchStockData(${code}): Close 値なし`, null, JSON.stringify(latest));
-        return { code, name: companyName, error: true };
+        logError(`fetchStockData(${code}): buildResult エラー`, null, JSON.stringify(latest));
+        return { code, error: true };
       }
 
       cachePrice(code, result);
@@ -1139,7 +1123,6 @@
       if (r.status !== 'fulfilled') return;
       const pd = r.value;
       cachePrice(pd.code, pd);
-      updateListRow(pd.code, pd);
 
       if (pd.error) {
         failedCodes.push(pd.code);
@@ -1147,6 +1130,8 @@
         const s = findStock(pd.code);
         if (s && s.name !== pd.name) { s.name = pd.name; nameUpdated = true; }
       }
+
+      updateListRow(pd.code, pd);
     });
 
     if (nameUpdated) saveStocks();
@@ -1262,7 +1247,7 @@
     const s      = findStock(code);
     const nameEl = tr.querySelector('.stock-name');
     if (nameEl && s) {
-      nameEl.textContent = s.name || (pd.error ? '名称不明' : '取得中…');
+      nameEl.textContent = s.name || pd.name || '名称不明';
     }
 
     const cell = tr.querySelector('.price-cell');
@@ -1369,35 +1354,53 @@
   }
 
   // ===== 詳細画面 =====
+  function applyDetailPrice(pd) {
+    if (!pd) return;
+    const fmtPrc = v => v != null ? '¥' + Number(v).toLocaleString('ja-JP') : '―';
+    const fmtNum = v => v != null ? Number(v).toLocaleString('ja-JP') : '―';
+    const fmtPct = v => v != null ? (Math.abs(v) < 2 ? (v * 100).toFixed(2) : Number(v).toFixed(2)) + '%' : '―';
+
+    const priceEl  = document.getElementById('d-price');
+    const changeEl = document.getElementById('d-change');
+    if (!pd.error && pd.priceText) {
+      priceEl.textContent  = '¥' + pd.priceText;
+      changeEl.textContent = pd.changeText;
+      changeEl.className   = 'detail-change ' + pd.dir;
+    } else {
+      priceEl.textContent  = '―';
+      changeEl.textContent = pd.error ? '取得失敗' : '―';
+      changeEl.className   = 'detail-change flat';
+    }
+
+    setText('d-per',           pd.per       != null ? pd.per + ' 倍'   : '―');
+    setText('d-pbr',           pd.pbr       != null ? pd.pbr + ' 倍'   : '―');
+    setText('d-div-yield',     pd.divYield  != null ? fmtPct(pd.divYield) : '―');
+    setText('d-div-per-share', pd.divPerShr != null ? fmtNum(pd.divPerShr) + ' 円' : '―');
+    setText('d-high-year',     fmtPrc(pd.highYear));
+    setText('d-low-year',      fmtPrc(pd.lowYear));
+    setText('d-market-cap',    pd.marketCap != null ? fmtNum(pd.marketCap) : '―');
+    setText('d-open',          fmtPrc(pd.open));
+    setText('d-high',          fmtPrc(pd.high));
+    setText('d-low',           fmtPrc(pd.low));
+    setText('d-volume',        pd.volume != null ? fmtNum(pd.volume) : '―');
+  }
+
   function showDetail(code) {
     currentDetailCode = code;
     const stock = findStock(code);
     if (!stock) return;
-    const pd   = priceCache[code] || null;
     const name = stock.name || code;
 
     document.getElementById('d-code').textContent = code;
     document.getElementById('d-name').textContent = name;
     document.getElementById('detail-breadcrumb').textContent = `一覧 › ${code} ${name}`;
 
-    const priceEl  = document.getElementById('d-price');
-    const changeEl = document.getElementById('d-change');
-    if (pd && !pd.error && pd.priceText) {
-      priceEl.textContent  = '¥' + pd.priceText;
-      changeEl.textContent = pd.changeText;
-      changeEl.className   = 'detail-change ' + pd.dir;
-    } else {
-      priceEl.textContent  = '―';
-      changeEl.textContent = pd && pd.error ? '取得失敗' : '―';
-      changeEl.className   = 'detail-change flat';
-    }
-
     const yfUrl = YF_BASE + code + '.T';
-    document.getElementById('yahoo-link').href               = yfUrl;
-    document.getElementById('yahoo-label-code').textContent  = `${code} ${name}`;
-    document.getElementById('minkabu-link').href             = `https://minkabu.jp/stock/${code}`;
+    document.getElementById('yahoo-link').href                = yfUrl;
+    document.getElementById('yahoo-label-code').textContent   = `${code} ${name}`;
+    document.getElementById('minkabu-link').href              = `https://minkabu.jp/stock/${code}`;
     document.getElementById('minkabu-label-code').textContent = `${code} ${name}`;
-    document.getElementById('kabutan-link').href             = `https://kabutan.jp/stock/?code=${code}`;
+    document.getElementById('kabutan-link').href              = `https://kabutan.jp/stock/?code=${code}`;
     document.getElementById('kabutan-label-code').textContent = `${code} ${name}`;
     document.getElementById('d-overview-link').href  = yfUrl;
     document.getElementById('d-dividend-link').href  = yfUrl;
@@ -1409,25 +1412,34 @@
     document.getElementById('d-alarm-date').value = stock.alarmDate || '';
     refreshDetailAlarmBtn();
 
-    const fmtPrc = v => v != null ? '¥' + Number(v).toLocaleString('ja-JP') : '―';
-    const fmtNum = v => v != null ? Number(v).toLocaleString('ja-JP') : '―';
-    const fmtPct = v => v != null ? (Math.abs(v) < 2 ? (v * 100).toFixed(2) : Number(v).toFixed(2)) + '%' : '―';
-
-    setText('d-per',           pd?.per       != null ? pd.per + ' 倍'   : '―');
-    setText('d-pbr',           pd?.pbr       != null ? pd.pbr + ' 倍'   : '―');
-    setText('d-div-yield',     pd?.divYield  != null ? fmtPct(pd.divYield) : '―');
-    setText('d-div-per-share', pd?.divPerShr != null ? fmtNum(pd.divPerShr) + ' 円' : '―');
-    setText('d-high-year',     fmtPrc(pd?.highYear));
-    setText('d-low-year',      fmtPrc(pd?.lowYear));
-    setText('d-market-cap',    pd?.marketCap != null ? fmtNum(pd.marketCap) : '―');
-    setText('d-open',          fmtPrc(pd?.open));
-    setText('d-high',          fmtPrc(pd?.high));
-    setText('d-low',           fmtPrc(pd?.low));
-    setText('d-volume',        pd?.volume != null ? fmtNum(pd.volume) : '―');
+    // キャッシュがあれば即時表示し、バックグラウンドで最新価格を取得して更新
+    const cached = priceCache[code];
+    if (cached) {
+      applyDetailPrice(cached);
+    } else {
+      document.getElementById('d-price').textContent  = '―';
+      document.getElementById('d-change').textContent = '―';
+      document.getElementById('d-change').className   = 'detail-change flat';
+    }
 
     document.getElementById('list-view').style.display   = 'none';
     document.getElementById('detail-view').style.display = 'block';
     window.scrollTo(0, 0);
+
+    // キャッシュの有無に関わらず最新価格をバックグラウンドで取得
+    delete priceCache[code]; // キャッシュを破棄して強制再取得
+    fetchStockData(code).then(pd => {
+      if (currentDetailCode !== code) return; // 別銘柄に遷移済みなら無視
+      priceCache[code] = pd;
+      applyDetailPrice(pd);
+      if (!pd.error && pd.name) {
+        const s = findStock(code);
+        if (s && s.name !== pd.name) { s.name = pd.name; saveStocks(); }
+        document.getElementById('d-name').textContent = pd.name || name;
+        document.getElementById('detail-breadcrumb').textContent = `一覧 › ${code} ${pd.name || name}`;
+      }
+      updateListRow(code, pd);
+    });
   }
 
   function showList() {
